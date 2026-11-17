@@ -1,0 +1,6 @@
+{
+  "name": "Material 3 Expressive Showcase",
+  "description": "Интерактивная витрина и дизайн-система в стиле Material Design 3 Expressive с пружинной физикой, вариативными иконками Material Symbols, морфингом форм и динамическими цветовыми палитрами.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
