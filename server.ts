@@ -58,8 +58,7 @@ const RESPONSE_SCHEMA = {
 };
 
 async function callGeminiWithRetry(promptContents: string, systemInstruction: string) {
-  // Try high-availability gemini-3.1-flash-lite first, then gemini-4-hydrogen with retry
-  const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+  const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-2.5-flash'];
   let lastError: unknown = null;
   const ai = getAiClient();
 
@@ -75,16 +74,39 @@ async function callGeminiWithRetry(promptContents: string, systemInstruction: st
           responseSchema: RESPONSE_SCHEMA,
         },
       });
-      const rawText = (response.text ?? '{}').trim();
-      return JSON.parse(rawText);
+      const rawText = (response.text ?? '').trim();
+      if (!rawText) {
+        throw new Error('Empty model response');
+      }
+      const cleanedJson = rawText
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+      try {
+        return JSON.parse(cleanedJson);
+      } catch {
+        return {
+          thoughtSteps: ['Анализ запроса и формулирование ответа'],
+          reply: rawText,
+          artifactTitle: '',
+          artifactCode: '',
+        };
+      }
     } catch (err: unknown) {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
-      const isTransient = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand') || msg.includes('429');
-      if (!isTransient) {
+      const isTransient =
+        msg.includes('503') ||
+        msg.includes('UNAVAILABLE') ||
+        msg.includes('high demand') ||
+        msg.includes('429') ||
+        msg.includes('404') ||
+        msg.includes('Empty model response');
+      if (!isTransient && attempt === modelsToTry.length - 1) {
         throw err;
       }
-      await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
     }
   }
   throw lastError;
@@ -95,7 +117,7 @@ app.post('/api/fable-chat', async (req, res) => {
     const {
       message,
       history = [],
-      modelName = 'Opus 5.5',
+      modelName = 'Sonnet 5.5',
       effort = 'Low',
       mode = 'chat',
       attachments = [],
@@ -110,7 +132,7 @@ app.post('/api/fable-chat', async (req, res) => {
       Array.isArray(history) && history.length > 0
         ? '\n\nКонтекст предыдущих сообщений диалога:\n' +
           history
-            .slice(-8)
+            .slice(-10)
             .map((h: { role: string; text: string }) => `${h.role === 'user' ? 'Пользователь' : 'Claude'}: ${h.text}`)
             .join('\n')
         : '';
@@ -120,18 +142,29 @@ app.post('/api/fable-chat', async (req, res) => {
         ? `\nПрикреплённые файлы: ${attachments.join(', ')}`
         : '';
 
-    const systemInstruction = `Ты — Claude (${modelName}, уровень размышлений: ${effort}) на максимальном тарифе "Ultra plan".
-Твоя главная задача — ТОЧНО понимать, что написал пользователь, и отвечать по существу его вопроса, задачи или реплики.
+    const effortGuide =
+      effort === 'Max'
+        ? 'Дай максимально глубокий, всесторонний и продуманный ответ с нюансами, аргументами и примерами.'
+        : effort === 'High'
+          ? 'Дай подробный, хорошо структурированный и глубокий ответ.'
+          : effort === 'Medium'
+            ? 'Дай чёткий и содержательный ответ оптимальной длины.'
+            : 'Отвечай живо, точно и лаконично, без лишней воды.';
+
+    const systemInstruction = `Ты — Claude (${modelName}, глубина мышления: ${effort}) на тарифе "Ultra plan".
+Ты универсальный, эрудированный, внимательный и приятный собеседник и помощник для любых тем: живое общение, советы, объяснение сложных идей, творчество, редактура текста, учёба, логика, программирование и дизайн.
+
 Правила:
-1. Всегда отвечай именно на то, о чём спрашивает или что пишет пользователь (если это "Привет" — тепло и естественно поздоровайся и спроси, чем помочь; если вопрос — дай точный, глубокий и понятный ответ; если просит HTML-страницу, виджет, игру или интерфейс — напиши полный, самодостаточный, рабочий HTML со встроенными <style> и <script> в поле artifactCode и укажи artifactTitle с расширением ".html", например "index.html" или "widget.html", чтобы пользователь мог сразу протестировать его в окне Preview прямо в чате!).
-2. Если пользователь сам прислал HTML-код в сообщении (например, чтобы протестировать, проверить или улучшить его), кратко разбери код, подскажи улучшения (если нужно) и обязательно верни готовый рабочий вариант в artifactCode с расширением ".html".
-3. Если включён режим "${mode === 'plan' ? 'Ultra Plan (режим планирования)' : 'Chat'}", ${
+1. Отвечай на языке пользователя естественно, грамотно и по существу — как умный живой собеседник. ${effortGuide}
+2. НИКОГДА не своди обычный разговор к HTML, программированию или «тестированию HTML», если пользователь сам не просит написать код, сайт, виджет или HTML-страницу.
+3. Если пользователь действительно просит создать HTML-страницу, интерфейс, игру или прислал HTML-код на проверку — напиши чистый самодостаточный код со встроенными <style> и <script> в поле artifactCode и укажи artifactTitle с расширением ".html" (например, "index.html"), чтобы он открылся в окне Preview. Если просит код на другом языке (Python, JS, SQL и т.д.) — помести его в artifactCode с подходящим именем файла.
+4. Для обычного общения, вопросов, объяснений, идей, шуток или обсуждений оставляй поля artifactTitle и artifactCode пустыми строками "".
+5. Режим диалога: "${mode === 'plan' ? 'Plan (структурированный план)' : 'Chat (свободное общение)'}". ${
       mode === 'plan'
-        ? 'структурируй ответ как чёткий пошаговый план действий по теме запроса пользователя.'
-        : 'отвечай естественно, дружелюбно и содержательно.'
+        ? 'Оформи ответ как ясный, практичный пошаговый план действий с краткими пояснениями.'
+        : 'Поддерживай естественный диалог, задавай уместные уточняющие вопросы, если это помогает пользователю.'
     }
-4. В поле thoughtSteps верни 3 коротких, осмысленных шага твоих размышлений над этим конкретным запросом пользователя.
-5. Поле artifactCode заполняй ТОЛЬКО тогда, когда пользователь просит код, HTML, интерфейс, игру, таблицу или шаблон (иначе оставь artifactTitle и artifactCode пустыми строками).`;
+6. В поле thoughtSteps верни 2–4 коротких, осмысленных шага твоих размышлений именно над этим запросом.`;
 
     const parsed = await callGeminiWithRetry(
       `Сообщение пользователя: ${message}${attachContext}${historyContext}`,
