@@ -5015,52 +5015,118 @@ ${trimmed}
           flushList();
         }
 
-        /* 8. Built-in Fallback Generator (Used only if AI backend is unreachable) */
-        function buildSmartFallbackResponse(text) {
+        /* 8. Error Diagnostic & Local HTML-Sandbox Helper */
+        function buildErrorDiagnosticResponse(text, errorInfo) {
           const clean = text.trim();
-          const lower = clean.toLowerCase();
 
           if (looksLikeRawHtml(clean)) {
             return {
+              isError: false,
               thoughtSteps: [
                 'Обнаружен HTML-код во входящем сообщении',
                 'Запуск изолированного живого Preview в окне чата'
               ],
               reply: 'Запустил ваш HTML-код в живой песочнице ниже. Вы можете переключаться между **Preview** и **Кодом**, чтобы править разметку на лету.',
               artifactTitle: 'live_test.html',
-              artifactCode: clean
+              artifactCode: stripMarkdownHtmlFences(clean)
             };
           }
 
-          if (/^(привет|здравствуй|хай|йо|добрый|hello|hi|как дела)\b/i.test(lower)) {
-            return {
-              thoughtSteps: ['Подготовка приветственного ответа'],
-              reply: `Привет! Я **Claude ${activeModel}**. Готов поболтать на любую тему, объяснить сложный вопрос, помочь с идеями, текстом или кодом. О чём поговорим?`
-            };
-          }
-
-          if (/(сделай|создай|напиши).*(html|страниц|виджет|кнопк|кликер|игр)/i.test(lower)) {
-            return {
-              thoughtSteps: [
-                `Проектирование интерактивного HTML-артефакта (${activeModel})`,
-                'Сборка стилей и скрипта в единый файл'
-              ],
-              reply: 'Готово! Подготовил интерактивный пример и открыл его в окне **Preview**:',
-              artifactTitle: 'interactive_demo.html',
-              artifactCode: DEFAULT_SANDBOX_HTML
-            };
+          const status = errorInfo?.status || 0;
+          const detail = errorInfo?.detail || '';
+          let friendlyReason = 'Сервер ИИ временно недоступен или не отвечает.';
+          if (status === 403 || /API_KEY_INVALID|PERMISSION_DENIED/i.test(detail)) {
+            friendlyReason = 'Ключ API отклонен или не имеет доступа (403). Проверьте настройки API-ключа в AI Studio (Settings > Secrets).';
+          } else if (status === 429 || /RESOURCE_EXHAUSTED/i.test(detail)) {
+            friendlyReason = 'Превышен лимит запросов к ИИ (429). Подождите несколько секунд и повторите попытку.';
+          } else if (status === 500 && /GEMINI_API_KEY/i.test(detail)) {
+            friendlyReason = 'На сервере не настроен `GEMINI_API_KEY`.';
+          } else if (errorInfo?.nonJson) {
+            friendlyReason = 'Сервер вернул HTML вместо JSON (возможно, открыта статическая сборка без запущенного API-сервера).';
+          } else if (status > 0) {
+            friendlyReason = `Сервер вернул ошибку HTTP ${status}${detail ? ': ' + detail.slice(0, 140) : ''}.`;
+          } else if (detail) {
+            friendlyReason = `Сетевая ошибка при обращении к серверу: ${detail.slice(0, 140)}.`;
           }
 
           return {
-            thoughtSteps: [`Проверка соединения для запроса: «${clean.slice(0, 45)}»`],
-            reply: `Сейчас сервер ИИ временно не ответил на запрос «${clean}». Нажмите кнопку повтора ниже (↻), чтобы отправить сообщение ещё раз.`
+            isError: true,
+            thoughtSteps: [
+              `Запрос: «${clean.slice(0, 45)}»`,
+              `Диагностика: ${status ? 'HTTP ' + status : 'Network/Parse error'}`
+            ],
+            reply: `Не удалось получить ответ от ИИ на запрос «${clean}».\n\n**Причина:** ${friendlyReason}\n\nНажмите кнопку повтора ниже (↻), чтобы повторить запрос без дублирования сообщений.`
           };
         }
 
+        async function fetchFableChatWithRetry(payload, onRetryStatus) {
+          const maxAttempts = 3;
+          let lastErrorInfo = { status: 0, detail: '', nonJson: false };
+
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 35000);
+            try {
+              const res = await fetch('/api/fable-chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal: controller.signal
+              });
+              clearTimeout(timeoutId);
+
+              const contentType = (res.headers.get('content-type') || '').toLowerCase();
+              let jsonBody = null;
+              if (contentType.includes('application/json')) {
+                try {
+                  jsonBody = await res.json();
+                } catch {
+                  jsonBody = null;
+                }
+              }
+
+              if (res.ok && jsonBody && typeof jsonBody.reply === 'string') {
+                return { ok: true, data: jsonBody };
+              }
+
+              if (res.ok && !jsonBody) {
+                lastErrorInfo = { status: res.status, detail: 'Non-JSON response', nonJson: true };
+                return { ok: false, errorInfo: lastErrorInfo };
+              }
+
+              const errDetail =
+                (jsonBody && typeof jsonBody.error === 'string' && jsonBody.error) ||
+                `HTTP ${res.status}`;
+              lastErrorInfo = { status: res.status, detail: errDetail, nonJson: false };
+
+              const shouldRetry = [408, 429, 502, 503, 504].includes(res.status) && attempt < maxAttempts - 1;
+              if (!shouldRetry) {
+                return { ok: false, errorInfo: lastErrorInfo };
+              }
+            } catch (err) {
+              clearTimeout(timeoutId);
+              const msg = err && err.name === 'AbortError'
+                ? 'Превышено время ожидания ответа (35 сек)'
+                : (err && err.message) || 'Failed to fetch';
+              lastErrorInfo = { status: 0, detail: msg, nonJson: false };
+              if (attempt >= maxAttempts - 1) {
+                return { ok: false, errorInfo: lastErrorInfo };
+              }
+            }
+
+            if (typeof onRetryStatus === 'function') {
+              onRetryStatus(attempt + 2, maxAttempts);
+            }
+            await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+          }
+
+          return { ok: false, errorInfo: lastErrorInfo };
+        }
+
         /* 9. Main Send Handler */
-        async function sendPrompt(customPrompt) {
+        async function sendPrompt(customPrompt, replaceTurnPair = null) {
           const rawText = (customPrompt !== undefined ? customPrompt : composerTextarea?.value || '').trim();
-          const currentAttachments = [...attachedFiles];
+          const currentAttachments = replaceTurnPair ? [] : [...attachedFiles];
           const displayUserText =
             (currentAttachments.length > 0 ? `[Файлы: ${currentAttachments.join(', ')}] ` : '') + rawText;
 
@@ -5072,13 +5138,21 @@ ${trimmed}
           if (composerTextarea && customPrompt === undefined) {
             composerTextarea.value = '';
           }
-          attachedFiles.length = 0;
-          renderAttachedChips();
-          syncComposerUI();
+          if (!replaceTurnPair) {
+            attachedFiles.length = 0;
+            renderAttachedChips();
+            syncComposerUI();
+          }
           closeAllPopovers();
 
           if (heroEmptyState) heroEmptyState.style.display = 'none';
           if (chatThread) chatThread.classList.add('visible');
+
+          // Remove stale failed pair on in-place retry so chat never fills with duplicates
+          if (replaceTurnPair) {
+            replaceTurnPair.userRow?.remove();
+            replaceTurnPair.asstRow?.remove();
+          }
 
           // Render User Message Bubble
           const userRow = document.createElement('div');
@@ -5124,30 +5198,33 @@ ${trimmed}
           stageScroll.scrollTop = stageScroll.scrollHeight;
 
           const startTime = performance.now();
-          let resultData = null;
+          const cleanHistoryForRequest = conversationHistory.filter(
+            (h) =>
+              h &&
+              typeof h.text === 'string' &&
+              !h.text.includes('Сейчас сервер ИИ временно не ответил') &&
+              !h.text.includes('Не удалось получить ответ от ИИ')
+          );
 
-          try {
-            const res = await fetch('/api/fable-chat', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                message: rawText,
-                history: conversationHistory,
-                modelName: activeModel,
-                effort: activeEffort,
-                mode: activeMode,
-                attachments: currentAttachments
-              })
-            });
-
-            if (res.ok) {
-              resultData = await res.json();
-            } else {
-              resultData = buildSmartFallbackResponse(rawText);
+          const fetchOutcome = await fetchFableChatWithRetry(
+            {
+              message: rawText,
+              history: cleanHistoryForRequest,
+              modelName: activeModel,
+              effort: activeEffort,
+              mode: activeMode,
+              attachments: currentAttachments
+            },
+            (nextAttempt, total) => {
+              if (statusTextEl) {
+                statusTextEl.textContent = `Повторное подключение (${nextAttempt}/${total})...`;
+              }
             }
-          } catch (_err) {
-            resultData = buildSmartFallbackResponse(rawText);
-          }
+          );
+
+          const resultData = fetchOutcome.ok
+            ? { ...fetchOutcome.data, isError: false }
+            : buildErrorDiagnosticResponse(rawText, fetchOutcome.errorInfo);
 
           // If user pasted HTML in normal Chat mode and backend didn't attach artifact, still show live preview!
           if (looksLikeRawHtml(rawText) && (!resultData.artifactCode || !resultData.artifactCode.trim())) {
@@ -5155,19 +5232,36 @@ ${trimmed}
             resultData.artifactCode = stripMarkdownHtmlFences(rawText);
           }
 
-          conversationHistory.push({ role: 'user', text: rawText });
-          conversationHistory.push({ role: 'assistant', text: resultData.reply || '' });
+          const stepsArr = Array.isArray(resultData.thoughtSteps) ? resultData.thoughtSteps : [];
+          const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(1) + 's';
+
+          if (!resultData.isError) {
+            conversationHistory.push({ role: 'user', text: rawText });
+            conversationHistory.push({ role: 'assistant', text: resultData.reply || '' });
+
+            recordChatTurn({
+              userText: displayUserText,
+              rawUserText: rawText,
+              assistantReply: resultData.reply || '',
+              thoughtSteps: stepsArr,
+              artifactTitle: resultData.artifactTitle || '',
+              artifactCode: resultData.artifactCode || '',
+              elapsedSec,
+              modelName: activeModel,
+              effort: activeEffort
+            });
+          }
 
           thinkingCard.classList.remove('is-thinking');
           if (sparkIconInCard) sparkIconInCard.classList.remove('spin-slow');
 
-          const elapsedSec = ((performance.now() - startTime) / 1000).toFixed(1) + 's';
           if (statusTextEl) {
             statusTextEl.classList.remove('is-shimmering');
-            statusTextEl.textContent = `Thought for ${elapsedSec} · ${activeModel} (${activeEffort})`;
+            statusTextEl.textContent = resultData.isError
+              ? `Ошибка соединения · ${elapsedSec}`
+              : `Thought for ${elapsedSec} · ${activeModel} (${activeEffort})`;
           }
 
-          const stepsArr = Array.isArray(resultData.thoughtSteps) ? resultData.thoughtSteps : [];
           if (detailsBox && stepsArr.length > 0) {
             const listEl = document.createElement('div');
             listEl.className = 'thinking-step-list';
@@ -5187,23 +5281,12 @@ ${trimmed}
             detailsBox.appendChild(listEl);
           }
 
-          // Persist conversation turn (unless Incognito Ghost mode is on)
-          recordChatTurn({
-            userText: displayUserText,
-            rawUserText: rawText,
-            assistantReply: resultData.reply || '',
-            thoughtSteps: stepsArr,
-            artifactTitle: resultData.artifactTitle || '',
-            artifactCode: resultData.artifactCode || '',
-            elapsedSec,
-            modelName: activeModel,
-            effort: activeEffort
-          });
-
           const fullReply = resultData.reply || '';
           const textPara = document.createElement('div');
           textPara.style.whiteSpace = 'pre-wrap';
           proseBox.appendChild(textPara);
+
+          const retryTarget = resultData.isError ? { userRow, asstRow } : null;
 
           let charIdx = 0;
           const stepSize = Math.max(5, Math.ceil(fullReply.length / 80));
@@ -5223,7 +5306,7 @@ ${trimmed}
                 proseBox.appendChild(artCard);
               }
 
-              asstRow.appendChild(createMessageActionsBar(fullReply, rawText, activeModel));
+              asstRow.appendChild(createMessageActionsBar(fullReply, rawText, activeModel, retryTarget));
               stageScroll.scrollTop = stageScroll.scrollHeight;
               syncScrollBottomBtn();
             }
@@ -5231,7 +5314,7 @@ ${trimmed}
           requestAnimationFrame(streamChars);
         }
 
-        function createMessageActionsBar(fullReply, rawTextForRetry, modelLabel) {
+        function createMessageActionsBar(fullReply, rawTextForRetry, modelLabel, replaceTurnPair = null) {
           const actionsBar = document.createElement('div');
           actionsBar.className = 'msg-actions-bar';
           actionsBar.innerHTML = `
@@ -5259,7 +5342,7 @@ ${trimmed}
             showToast(!pressed ? 'Спасибо за оценку!' : 'Оценка снята');
           });
           actionsBar.querySelector('.retry-reply-btn').addEventListener('click', () => {
-            sendPrompt(rawTextForRetry);
+            sendPrompt(rawTextForRetry, replaceTurnPair);
           });
           return actionsBar;
         }
@@ -5359,8 +5442,14 @@ ${trimmed}
           }
 
           (chat.turns || []).forEach((turn) => {
-            conversationHistory.push({ role: 'user', text: turn.rawUserText || turn.userText || '' });
-            conversationHistory.push({ role: 'assistant', text: turn.assistantReply || '' });
+            const replyTxt = turn.assistantReply || '';
+            const isLegacyError =
+              replyTxt.includes('Сейчас сервер ИИ временно не ответил') ||
+              replyTxt.includes('Не удалось получить ответ от ИИ');
+            if (!isLegacyError) {
+              conversationHistory.push({ role: 'user', text: turn.rawUserText || turn.userText || '' });
+              conversationHistory.push({ role: 'assistant', text: replyTxt });
+            }
 
             const userRow = document.createElement('div');
             userRow.className = 'user-msg-row';

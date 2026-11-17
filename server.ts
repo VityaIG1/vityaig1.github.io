@@ -3,7 +3,7 @@ import http from 'http';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,11 +15,18 @@ const PORT = Number(process.env.PORT) || 3000;
 app.use(express.json({ limit: '2mb' }));
 
 let cachedAi: GoogleGenAI | null = null;
+let cachedKey = '';
 function getAiClient(): GoogleGenAI {
-  if (!cachedAi) {
+  const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY is not configured');
+  }
+  if (!cachedAi || cachedKey !== apiKey) {
+    cachedKey = apiKey;
     cachedAi = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
+      apiKey,
       httpOptions: {
+        timeout: 15000,
         headers: {
           'User-Agent': 'aistudio-build',
         },
@@ -30,7 +37,8 @@ function getAiClient(): GoogleGenAI {
 }
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
+  const hasApiKey = Boolean((process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim());
+  res.json({ ok: true, hasApiKey });
 });
 
 const RESPONSE_SCHEMA = {
@@ -57,26 +65,59 @@ const RESPONSE_SCHEMA = {
   required: ['thoughtSteps', 'reply', 'artifactTitle', 'artifactCode'],
 };
 
-async function callGeminiWithRetry(promptContents: string, systemInstruction: string) {
-  const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen', 'gemini-2.5-flash'];
+function resolveThinkingLevel(model: string, effort: string): ThinkingLevel | undefined {
+  if (model !== 'gemini-4-hydrogen') return undefined;
+  if (effort === 'Max') return ThinkingLevel.XHIGH;
+  if (effort === 'High') return ThinkingLevel.HIGH;
+  if (effort === 'Medium') return ThinkingLevel.MEDIUM;
+  return ThinkingLevel.LOW;
+}
+
+async function callGeminiWithRetry(promptContents: string, systemInstruction: string, effort: string) {
+  const attemptsConfig = [
+    { model: 'gemini-3.1-flash-lite', useJsonSchema: true, timeoutMs: 12000 },
+    { model: 'gemini-4-hydrogen', useJsonSchema: true, timeoutMs: 14000 },
+    { model: 'gemini-3.1-flash-lite', useJsonSchema: false, timeoutMs: 12000 },
+  ];
   let lastError: unknown = null;
   const ai = getAiClient();
 
-  for (let attempt = 0; attempt < modelsToTry.length; attempt++) {
-    const model = modelsToTry[attempt];
+  for (let attempt = 0; attempt < attemptsConfig.length; attempt++) {
+    const { model, useJsonSchema, timeoutMs } = attemptsConfig[attempt];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      const thinkingLevel = resolveThinkingLevel(model, effort);
+      const config: Record<string, unknown> = {
+        systemInstruction,
+        abortSignal: controller.signal,
+      };
+      if (useJsonSchema) {
+        config.responseMimeType = 'application/json';
+        config.responseSchema = RESPONSE_SCHEMA;
+      }
+      if (thinkingLevel) {
+        config.thinkingConfig = { thinkingLevel };
+      }
+
       const response = await ai.models.generateContent({
         model,
         contents: promptContents,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: RESPONSE_SCHEMA,
-        },
+        config,
       });
+      clearTimeout(timer);
+
       const rawText = (response.text ?? '').trim();
       if (!rawText) {
         throw new Error('Empty model response');
+      }
+      if (!useJsonSchema) {
+        return {
+          thoughtSteps: ['Анализ запроса и подготовка ответа'],
+          reply: rawText,
+          artifactTitle: '',
+          artifactCode: '',
+        };
       }
       const cleanedJson = rawText
         .replace(/^```json\s*/i, '')
@@ -84,7 +125,21 @@ async function callGeminiWithRetry(promptContents: string, systemInstruction: st
         .replace(/\s*```$/i, '')
         .trim();
       try {
-        return JSON.parse(cleanedJson);
+        const parsed = JSON.parse(cleanedJson);
+        if (parsed && typeof parsed.reply === 'string') {
+          return {
+            thoughtSteps: Array.isArray(parsed.thoughtSteps) ? parsed.thoughtSteps : [],
+            reply: parsed.reply,
+            artifactTitle: typeof parsed.artifactTitle === 'string' ? parsed.artifactTitle : '',
+            artifactCode: typeof parsed.artifactCode === 'string' ? parsed.artifactCode : '',
+          };
+        }
+        return {
+          thoughtSteps: ['Анализ запроса и формулирование ответа'],
+          reply: rawText,
+          artifactTitle: '',
+          artifactCode: '',
+        };
       } catch {
         return {
           thoughtSteps: ['Анализ запроса и формулирование ответа'],
@@ -94,19 +149,23 @@ async function callGeminiWithRetry(promptContents: string, systemInstruction: st
         };
       }
     } catch (err: unknown) {
+      clearTimeout(timer);
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
-      const isTransient =
-        msg.includes('503') ||
-        msg.includes('UNAVAILABLE') ||
-        msg.includes('high demand') ||
-        msg.includes('429') ||
-        msg.includes('404') ||
-        msg.includes('Empty model response');
-      if (!isTransient && attempt === modelsToTry.length - 1) {
+      console.warn(`[fable-chat] attempt ${attempt + 1} (${model}, json=${useJsonSchema}) failed:`, msg);
+
+      // Fail fast on auth/key errors since retries won't fix an invalid or missing API key
+      const isAuthError =
+        msg.includes('API_KEY_INVALID') ||
+        msg.includes('PERMISSION_DENIED') ||
+        msg.includes('GEMINI_API_KEY is not configured');
+      if (isAuthError) {
         throw err;
       }
-      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+
+      if (attempt < attemptsConfig.length - 1) {
+        await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+      }
     }
   }
   throw lastError;
@@ -128,10 +187,20 @@ app.post('/api/fable-chat', async (req, res) => {
       return;
     }
 
+    const sanitizedHistory = Array.isArray(history)
+      ? history.filter(
+          (h: { role?: string; text?: string }) =>
+            h &&
+            typeof h.text === 'string' &&
+            h.text.trim().length > 0 &&
+            !h.text.includes('Сейчас сервер ИИ временно не ответил')
+        )
+      : [];
+
     const historyContext =
-      Array.isArray(history) && history.length > 0
+      sanitizedHistory.length > 0
         ? '\n\nКонтекст предыдущих сообщений диалога:\n' +
-          history
+          sanitizedHistory
             .slice(-10)
             .map((h: { role: string; text: string }) => `${h.role === 'user' ? 'Пользователь' : 'Claude'}: ${h.text}`)
             .join('\n')
@@ -168,13 +237,22 @@ app.post('/api/fable-chat', async (req, res) => {
 
     const parsed = await callGeminiWithRetry(
       `Сообщение пользователя: ${message}${attachContext}${historyContext}`,
-      systemInstruction
+      systemInstruction,
+      String(effort || 'Low')
     );
     res.json(parsed);
   } catch (error: unknown) {
     const errMsg = error instanceof Error ? error.message : String(error);
     console.error('Error in /api/fable-chat:', errMsg);
-    res.status(503).json({ error: errMsg });
+    const statusCode =
+      errMsg.includes('API_KEY_INVALID') || errMsg.includes('PERMISSION_DENIED')
+        ? 403
+        : errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED')
+          ? 429
+          : errMsg.includes('GEMINI_API_KEY is not configured')
+            ? 500
+            : 503;
+    res.status(statusCode).json({ error: errMsg, code: statusCode });
   }
 });
 
